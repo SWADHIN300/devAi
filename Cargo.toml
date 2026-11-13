@@ -1,0 +1,10 @@
+[package]
+name = "devpilot"
+version = "0.1.0"
+edition = "2024"
+description = "A local-first CLI foundation for the DevPilot AI coding agent"
+license = "MIT"
+
+[[bin]]
+name = "devpilot"
+path = "src/main.rs"
