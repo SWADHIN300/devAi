@@ -1,2 +1,7 @@
 /target/
 .env
+/agent/.venv/
+__pycache__/
+.pytest_cache/
+/devin-cli-research/
+/
