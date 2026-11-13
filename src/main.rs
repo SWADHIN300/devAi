@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
@@ -36,8 +36,7 @@ fn main() -> ExitCode {
 
 fn run(args: Vec<String>) -> Result<(), String> {
     let Some(command) = args.first().map(String::as_str) else {
-        print_help();
-        return Ok(());
+        return run_tui();
     };
 
     match command {
@@ -88,6 +87,178 @@ fn run(args: Vec<String>) -> Result<(), String> {
         _ => return Err(format!("unknown command '{command}'. Run `devpilot help`.")),
     }
     Ok(())
+}
+
+fn run_tui() -> Result<(), String> {
+    use crossterm::{
+        event::{self, Event, KeyCode, KeyModifiers},
+        terminal::{enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+        ExecutableCommand,
+    };
+    use ratatui::{
+        backend::CrosstermBackend,
+        layout::{Constraint, Direction, Layout},
+        style::{Color, Modifier, Style},
+        text::{Line, Span, Text},
+        widgets::{Block, Borders, Clear, Paragraph, Wrap},
+        Terminal,
+    };
+
+    struct TerminalSession;
+    impl Drop for TerminalSession {
+        fn drop(&mut self) {
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = io::stdout().execute(LeaveAlternateScreen);
+        }
+    }
+
+    enable_raw_mode().map_err(|e| format!("cannot enable terminal input: {e}"))?;
+    let _session = TerminalSession;
+    io::stdout()
+        .execute(EnterAlternateScreen)
+        .map_err(|e| format!("cannot open terminal screen: {e}"))?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend).map_err(|e| e.to_string())?;
+    let mut input = String::new();
+    let mut messages: Vec<(bool, String)> = Vec::new();
+    let mut status = "Ready · plans require approval before any edits".to_string();
+    let root = env::current_dir().map_err(|e| e.to_string())?;
+
+    loop {
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let rows = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(3), Constraint::Min(5), Constraint::Length(4), Constraint::Length(1)])
+                    .split(area);
+                let white = Style::default().fg(Color::White).bg(Color::Black);
+                let header = Paragraph::new(Line::from(vec![
+                    Span::styled(" DEVPILOT ", white.add_modifier(Modifier::BOLD)),
+                    Span::raw("  ·  "),
+                    Span::styled(root.display().to_string(), white),
+                ]))
+                .block(Block::default().borders(Borders::BOTTOM).border_style(white));
+                frame.render_widget(header, rows[0]);
+
+                if messages.is_empty() {
+                    let welcome = Paragraph::new(Text::from(vec![
+                        Line::from(""),
+                        Line::from(Span::styled("What are we building today?", white.add_modifier(Modifier::BOLD))),
+                        Line::from("Describe a task and DevPilot will inspect this workspace and draft a plan."),
+                        Line::from(""),
+                        Line::from("  /help     keyboard shortcuts and commands"),
+                        Line::from("  /analyze  summarize this workspace"),
+                        Line::from("  /files    list project files"),
+                    ]))
+                    .style(white)
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .block(Block::default().borders(Borders::ALL).border_style(white).title(" SESSION "));
+                    frame.render_widget(welcome, rows[1]);
+                } else {
+                    let lines: Vec<Line> = messages
+                        .iter()
+                        .flat_map(|(user, message)| {
+                            let role = if *user { " YOU " } else { " DEVPILOT " };
+                            std::iter::once(Line::from(Span::styled(role, white.add_modifier(Modifier::BOLD))))
+                                .chain(message.lines().map(|line| Line::from(Span::raw(line.to_string()))))
+                                .chain(std::iter::once(Line::from("")))
+                        })
+                        .collect();
+                    let conversation = Paragraph::new(lines)
+                        .style(white)
+                        .wrap(Wrap { trim: false })
+                        .block(Block::default().borders(Borders::ALL).border_style(white).title(" SESSION "));
+                    frame.render_widget(conversation, rows[1]);
+                }
+
+                let composer = Paragraph::new(Line::from(vec![
+                    Span::styled(" > ", white.add_modifier(Modifier::BOLD)),
+                    Span::raw(input.as_str()),
+                ]))
+                .style(white)
+                .block(Block::default().borders(Borders::ALL).border_style(white).title(" MESSAGE · ENTER TO SEND "));
+                frame.render_widget(Clear, rows[2]);
+                frame.render_widget(composer, rows[2]);
+                frame.render_widget(Paragraph::new(status.as_str()).style(white), rows[3]);
+                let cursor_x = (rows[2].x + 4 + input.chars().count() as u16).min(rows[2].right().saturating_sub(2));
+                frame.set_cursor_position((cursor_x, rows[2].y + 2));
+            })
+            .map_err(|e| e.to_string())?;
+
+        if let Event::Key(key) = event::read().map_err(|e| e.to_string())? {
+            if key.kind == event::KeyEventKind::Release {
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                KeyCode::Esc => break,
+                KeyCode::Backspace => { input.pop(); }
+                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => input.push(ch),
+                KeyCode::Enter => {
+                    let request = input.trim().to_string();
+                    input.clear();
+                    if request.is_empty() { continue; }
+                    match request.as_str() {
+                        "/quit" | "/exit" => break,
+                        "/clear" => { messages.clear(); status = "Session cleared".into(); continue; }
+                        "/help" => {
+                            messages.push((false, "Type a task to generate a plan. Commands: /analyze, /files, /clear, /quit. Esc or Ctrl+C exits.".into()));
+                            continue;
+                        }
+                        "/analyze" => {
+                            match analyze_summary(&root) {
+                                Ok(summary) => messages.push((false, summary)),
+                                Err(error) => messages.push((false, format!("Error: {error}"))),
+                            }
+                            continue;
+                        }
+                        "/files" => {
+                            match collect_files(&root) {
+                                Ok(files) => {
+                                    let shown = files.iter().take(100).map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n");
+                                    let suffix = if files.len() > 100 { format!("\n… and {} more", files.len() - 100) } else { String::new() };
+                                    messages.push((false, format!("{} files\n{}{}", files.len(), shown, suffix)));
+                                }
+                                Err(error) => messages.push((false, format!("Error: {error}"))),
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    messages.push((true, request.clone()));
+                    let files = collect_files(&root);
+                    let result = files.and_then(|files| {
+                        let summary = workspace_summary(&root, &files, &request);
+                        let url = env::var("DEVPILOT_AGENT_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".into());
+                        request_plan(&url, &request, &summary, &root)
+                    });
+                    match result {
+                        Ok((plan, model, run_id)) => {
+                            messages.push((false, format!("{plan}\n\nModel: {model}\nRun: {run_id}\n\nReview the plan in the dashboard before approving edits.")));
+                            status = format!("Plan ready · {run_id} · no files changed");
+                        }
+                        Err(error) => {
+                            messages.push((false, format!("Could not prepare plan: {error}")));
+                            status = "Request failed · check the planning service".into();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn analyze_summary(root: &Path) -> Result<String, String> {
+    let files = collect_files(root)?;
+    let manifests = ["Cargo.toml", "package.json", "pyproject.toml", "requirements.txt", "go.mod", "README.md"];
+    let found = files.iter().filter_map(|path| {
+        let text = path.to_string_lossy();
+        manifests.iter().find(|name| text.as_ref() == **name).map(|name| (*name).to_string())
+    }).collect::<Vec<_>>();
+    Ok(format!("Workspace: {}\nFiles: {}\nProject files: {}", root.display(), files.len(), if found.is_empty() { "none detected".into() } else { found.join(", ") }))
 }
 
 fn print_help() {

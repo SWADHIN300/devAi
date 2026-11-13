@@ -4,6 +4,8 @@ A local-first Rust CLI and Python agent service for exploring software projects.
 
 ## Commands
 
+Run `cargo run` without arguments to open the full-screen black-and-white terminal interface. Type a task and press Enter to request a plan. Use `/analyze`, `/files`, `/help`, `/clear`, and `/quit`; Esc or Ctrl+C exits. The planning service must be running for task requests.
+
 ```powershell
 cargo run -- analyze .
 cargo run -- list .
