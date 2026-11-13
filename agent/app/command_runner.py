@@ -7,7 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 
-async def run_in_docker(workspace: str, command: list[str], image: str = "rust:1.87", timeout: int = 120, retries: int = 1) -> dict[str, object]:
+async def run_in_docker(workspace: str, command: list[str], image: str = "rust:1.94", timeout: int = 120, retries: int = 1) -> dict[str, object]:
     if not command or len(command) > 64 or any(len(arg) > 4_000 for arg in command):
         raise ValueError("command must contain between 1 and 64 arguments")
     if not 1 <= timeout <= 900:

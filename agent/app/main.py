@@ -1,19 +1,44 @@
-"""HTTP API for DevPilot planning and gated workspace tools."""
+"""HTTP API for DevPilot planning, persistence, and gated workspace tools."""
 
-import difflib
-import hashlib
-import os
-import tempfile
+from contextlib import asynccontextmanager
 from pathlib import Path
+import time
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
+from .browser_tools import BrowserToolError, browse_url
+from .edit_tools import apply_preview, create_preview
+from .mcp_server import mcp
 from .openrouter_client import OpenRouterError, generate_plan
-from .workspace_tools import read_file, search_code
 from .command_runner import run_in_docker
+from .store import StateStore
+from .workspace_tools import read_file, search_code
 
-app = FastAPI(title="DevPilot Agent", version="0.1.0")
+mcp_http_app = mcp.streamable_http_app(
+    json_response=True,
+    stateless_http=True,
+    streamable_http_path="/",
+)
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    async with mcp.session_manager.run():
+        yield
+
+
+app = FastAPI(title="DevPilot Agent", version="0.2.0", lifespan=lifespan)
+app.mount("/mcp", mcp_http_app, name="mcp")
+STATIC_DIR = Path(__file__).parent / "static"
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.get("/", include_in_schema=False)
+async def dashboard() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html")
 
 
 class PlanRequest(BaseModel):
@@ -30,6 +55,7 @@ class PlanRequest(BaseModel):
 
 
 class PlanResponse(BaseModel):
+    run_id: str
     plan: str
     model: str
 
@@ -42,14 +68,56 @@ async def health() -> dict[str, str]:
 
 @app.post("/v1/plan", response_model=PlanResponse)
 async def create_plan(payload: PlanRequest) -> PlanResponse:
-    """Ask the configured model for a task plan; this endpoint does not write project files."""
+    """Create and persist a task plan that awaits explicit user approval."""
+    store = StateStore()
+    task_id = store.create_run(payload.task, payload.workspace_root)
     try:
-        plan, model = await generate_plan(payload.task, payload.workspace_summary, payload.workspace_root)
+        plan, model = await generate_plan(
+            payload.task, payload.workspace_summary, payload.workspace_root, task_id
+        )
     except ValueError as exc:
+        store.fail_run(task_id, str(exc))
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except OpenRouterError as exc:
+        store.fail_run(task_id, str(exc))
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    return PlanResponse(plan=plan, model=model)
+    except Exception:
+        store.fail_run(task_id, "planning failed")
+        raise
+    store.complete_run(task_id, plan, model)
+    return PlanResponse(run_id=task_id, plan=plan, model=model)
+
+
+@app.get("/v1/tasks")
+async def list_tasks(limit: int = 50) -> dict[str, object]:
+    try:
+        return {"tasks": StateStore().list_runs(limit)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/v1/tasks/{task_id}")
+async def get_task(task_id: str) -> dict[str, object]:
+    store = StateStore()
+    task = store.get_run(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    task["tool_events"] = store.list_tool_events(task_id)
+    return task
+
+
+@app.post("/v1/tasks/{task_id}/approve")
+async def approve_task(task_id: str) -> dict[str, str]:
+    if not StateStore().approve_run(task_id):
+        raise HTTPException(status_code=409, detail="task is missing or is not awaiting approval")
+    return {"id": task_id, "status": "approved"}
+
+
+@app.post("/v1/tasks/{task_id}/reject")
+async def reject_task(task_id: str) -> dict[str, str]:
+    if not StateStore().reject_run(task_id):
+        raise HTTPException(status_code=409, detail="task is missing or is not awaiting approval")
+    return {"id": task_id, "status": "rejected"}
 
 
 class ReadRequest(BaseModel):
@@ -75,112 +143,119 @@ class EditRequest(BaseModel):
     workspace_root: str = Field(min_length=1, max_length=4_000)
     path: str = Field(min_length=1, max_length=4_000)
     content: str = Field(max_length=1_000_000)
+    task_id: str | None = Field(default=None, max_length=64)
 
 
-class ApplyEditRequest(EditRequest):
-    expected_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+class ApplyEditRequest(BaseModel):
+    preview_id: str = Field(min_length=1, max_length=64)
     approved: bool = False
-
-
-def _edit_target(root_value: str, relative: str, allow_new: bool) -> tuple[Path, Path]:
-    root = Path(root_value).resolve(strict=True)
-    if not root.is_dir():
-        raise ValueError("workspace root must be a directory")
-    rel = Path(relative)
-    if rel.is_absolute() or ".." in rel.parts:
-        raise ValueError("edit path must stay inside the workspace")
-    if any(part in {".git", ".venv", "venv", "target", "node_modules", "dist", "build"} for part in rel.parts):
-        raise ValueError("editing generated, dependency, or version-control paths is not allowed")
-    name = rel.name.lower()
-    if name == ".env" or name.startswith(".env.") or any(
-        part in name for part in ("secret", "credential", "password", "api_key", "apikey", "access_key", "private_key", "id_rsa", "token")
-    ):
-        raise ValueError("editing secret-like files is not allowed")
-    target = root / rel
-    if target.exists():
-        target = target.resolve(strict=True)
-    elif allow_new:
-        target = target.parent.resolve(strict=True) / target.name
-    else:
-        raise ValueError("edit target does not exist")
-    if not target.is_relative_to(root) or (target.exists() and not target.is_file()):
-        raise ValueError("edit target must be a file inside the workspace")
-    return root, target
 
 
 @app.post("/v1/tools/read")
 async def tool_read(payload: ReadRequest) -> dict[str, str]:
     """Validated file-reading tool for an agent operating on one workspace."""
+    started = time.monotonic()
+    succeeded = False
     try:
-        return {"path": payload.path, "content": read_file(payload.workspace_root, payload.path)}
+        result = {"path": payload.path, "content": read_file(payload.workspace_root, payload.path)}
+        succeeded = True
+        return result
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        StateStore().record_tool_event("read_file", succeeded, int((time.monotonic() - started) * 1000))
 
 
 @app.post("/v1/tools/search")
 async def tool_search(payload: SearchRequest) -> dict[str, object]:
     """Validated code-search tool for an agent operating on one workspace."""
+    started = time.monotonic()
+    succeeded = False
     try:
-        return {"matches": search_code(payload.workspace_root, payload.query, payload.limit)}
+        result = {"matches": search_code(payload.workspace_root, payload.query, payload.limit)}
+        succeeded = True
+        return result
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        StateStore().record_tool_event("search_code", succeeded, int((time.monotonic() - started) * 1000))
 
 
 @app.post("/v1/tools/run")
 async def tool_run(payload: RunRequest) -> dict[str, object]:
     """Run a command in a network-disabled, resource-bounded Docker container."""
+    started = time.monotonic()
+    succeeded = False
     try:
-        return await run_in_docker(
+        result = await run_in_docker(
             payload.workspace_root, payload.command, payload.image, payload.timeout, payload.retries
         )
+        succeeded = bool(result.get("success"))
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except (OSError, TimeoutError) as exc:
         raise HTTPException(status_code=503, detail=f"Docker command runner unavailable: {exc}") from exc
+    finally:
+        StateStore().record_tool_event("run_tests", succeeded, int((time.monotonic() - started) * 1000))
+
+
+class BrowserRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=4_000)
+
+
+class BrowserFollowRequest(BrowserRequest):
+    link_text: str = Field(min_length=1, max_length=500)
+
+
+@app.post("/v1/tools/browser/open")
+async def browser_open(payload: BrowserRequest) -> dict[str, object]:
+    started = time.monotonic()
+    succeeded = False
+    try:
+        result = await browse_url(payload.url)
+        succeeded = True
+        return result
+    except BrowserToolError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        StateStore().record_tool_event("browser_open", succeeded, int((time.monotonic() - started) * 1000))
+
+
+@app.post("/v1/tools/browser/follow")
+async def browser_follow(payload: BrowserFollowRequest) -> dict[str, object]:
+    started = time.monotonic()
+    succeeded = False
+    try:
+        result = await browse_url(payload.url, follow_link_text=payload.link_text)
+        succeeded = True
+        return result
+    except BrowserToolError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        StateStore().record_tool_event("browser_follow_link", succeeded, int((time.monotonic() - started) * 1000))
 
 
 @app.post("/v1/edits/preview")
 async def preview_edit(payload: EditRequest) -> dict[str, object]:
-    """Show a unified diff and a content hash before an edit can be applied."""
+    """Persist a unified diff; a tied task must already have explicit plan approval."""
     try:
-        _, target = _edit_target(payload.workspace_root, payload.path, allow_new=True)
-        if target.exists() and target.stat().st_size > 1_000_000:
-            raise ValueError("edit target exceeds the 1,000,000 byte limit")
-        old_bytes = target.read_bytes() if target.exists() else None
-        old = old_bytes.decode("utf-8") if old_bytes is not None else ""
+        return create_preview(
+            StateStore(), payload.workspace_root, payload.path, payload.content, payload.task_id
+        )
     except (OSError, UnicodeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    diff = "".join(difflib.unified_diff(
-        old.splitlines(keepends=True), payload.content.splitlines(keepends=True),
-        fromfile=f"a/{payload.path}", tofile=f"b/{payload.path}",
-    ))
-    return {"path": payload.path, "diff": diff, "expected_sha256": hashlib.sha256(old_bytes).hexdigest() if old_bytes is not None else None}
 
 
 @app.post("/v1/edits/apply")
 async def apply_edit(payload: ApplyEditRequest) -> dict[str, str]:
-    """Apply a previously reviewed edit only with explicit approval and no race."""
+    """Apply exactly the persisted preview after explicit approval and a fresh hash check."""
     if not payload.approved:
         raise HTTPException(status_code=409, detail="explicit approval is required")
     try:
-        root, target = _edit_target(payload.workspace_root, payload.path, allow_new=True)
-        if target.exists() and target.stat().st_size > 1_000_000:
-            raise ValueError("edit target exceeds the 1,000,000 byte limit")
-        current = target.read_bytes() if target.exists() else None
-        current_hash = hashlib.sha256(current).hexdigest() if current is not None else None
-        if current_hash != payload.expected_sha256:
-            raise HTTPException(status_code=409, detail="file changed since diff preview; preview again")
-        if not target.is_relative_to(root):
-            raise HTTPException(status_code=400, detail="edit target escaped the workspace")
-        fd, temp_name = tempfile.mkstemp(prefix=".devpilot-", suffix=".tmp", dir=target.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="") as temp:
-                temp.write(payload.content)
-            Path(temp_name).replace(target)
-        finally:
-            Path(temp_name).unlink(missing_ok=True)
-        return {"path": payload.path, "status": "applied"}
-    except HTTPException:
-        raise
+        return apply_preview(StateStore(), payload.preview_id, payload.approved)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except (OSError, UnicodeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        status = 409 if "changed since" in str(exc) or "already been applied" in str(exc) else 400
+        raise HTTPException(status_code=status, detail=str(exc)) from exc

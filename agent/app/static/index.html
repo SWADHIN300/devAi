@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#10120f">
+    <title>DevPilot — local agent console</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="DevPilot home">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span>devpilot<span class="brand-dot">.</span></span>
+        </a>
+        <div class="topbar-meta">
+          <span class="local-label"><span class="status-light"></span> LOCAL SESSION</span>
+          <span class="divider"></span>
+          <span class="api-state" id="api-state">Connecting…</span>
+          <button class="icon-button" id="refresh-button" title="Refresh task list" aria-label="Refresh task list">↻</button>
+        </div>
+      </header>
+
+      <div class="workspace">
+        <aside class="run-rail" aria-label="Task history">
+          <div class="rail-heading">
+            <div><span class="eyebrow">WORKSPACE</span><h1>Task runs</h1></div>
+            <button id="new-task" class="new-run" title="Start a new task" aria-label="Start a new task">+</button>
+          </div>
+          <div class="run-list" id="run-list" aria-live="polite">
+            <div class="rail-loading"><span class="pulse"></span> Loading history</div>
+          </div>
+          <div class="rail-footer"><span class="keycap">⌘</span> Your runs stay on this machine</div>
+        </aside>
+
+        <main class="main-pane">
+          <section class="command-section" aria-labelledby="command-title">
+            <div class="section-kicker"><span class="prompt-symbol">›_</span> NEW TASK <span class="kicker-line"></span><span class="kicker-note">PLAN FIRST · APPLY BY APPROVAL</span></div>
+            <h2 id="command-title">What are we <em>building?</em></h2>
+            <form id="task-form" class="command-form">
+              <label class="sr-only" for="workspace-root">Workspace path</label>
+              <div class="workspace-input"><span class="field-prefix">cwd</span><input id="workspace-root" name="workspace_root" value="." autocomplete="off" spellcheck="false" required><span class="path-hint">workspace root</span></div>
+              <label class="sr-only" for="task-input">Task request</label>
+              <textarea id="task-input" name="task" rows="3" maxlength="8000" placeholder="Describe the change you want to make…" required></textarea>
+              <div class="form-bottom"><span class="form-hint"><span class="return-icon">↵</span> Plan is saved for your review. Files stay untouched.</span><button class="primary-button" id="plan-button" type="submit"><span class="button-glyph">✳</span> Generate plan <span class="button-arrow">↗</span></button></div>
+            </form>
+            <div class="notice" id="global-notice" role="status" hidden></div>
+          </section>
+
+          <section class="task-section" id="task-section" aria-labelledby="task-heading">
+            <div class="section-heading">
+              <div><span class="eyebrow">SELECTED RUN</span><h2 id="task-heading">No task selected</h2></div>
+              <span class="status-badge idle" id="task-status">IDLE</span>
+            </div>
+            <div class="empty-state" id="task-empty">
+              <div class="empty-glyph" aria-hidden="true">⌁</div>
+              <h3>Your console is clear.</h3>
+              <p>Start a task above or select a previous run to inspect its plan and activity.</p>
+              <span class="empty-command">devpilot task <span>"your request"</span></span>
+            </div>
+            <div class="task-detail" id="task-detail" hidden>
+              <div class="task-meta"><span class="run-id" id="run-id"></span><span class="meta-separator">/</span><span id="task-model">—</span><span class="meta-separator">/</span><span id="task-time">—</span></div>
+              <div class="task-request"><span class="request-mark">›</span><span id="task-request"></span></div>
+              <div class="plan-block"><div class="block-label"><span><i class="live-dot"></i> MODEL PLAN</span><span id="plan-model"></span></div><pre id="plan-content"></pre></div>
+              <div class="approval-row" id="approval-row" hidden><span>Review the plan before continuing.</span><div><button class="quiet-button reject-button" id="reject-task">Reject</button><button class="approve-button" id="approve-task">Approve plan <span>↗</span></button></div></div>
+              <div class="approval-row approved-row" id="approved-row" hidden><span><span class="checkmark">✓</span> Plan approved. You can now prepare a safe edit preview below.</span></div>
+              <div class="activity-block"><div class="activity-title"><span class="eyebrow">TOOL ACTIVITY</span><span id="activity-count">0 events</span></div><div id="activity-list" class="activity-list"><div class="activity-empty">No tools have run for this task.</div></div></div>
+            </div>
+          </section>
+
+          <section class="edit-section" aria-labelledby="edit-heading">
+            <div class="edit-header"><div><span class="eyebrow">SAFE EDIT</span><h2 id="edit-heading">Review the diff</h2></div><span class="lock-label"><span aria-hidden="true">◈</span> APPLY IS ALWAYS MANUAL</span></div>
+            <form id="edit-form" class="edit-form">
+              <div class="edit-fields">
+                <label>File path<input id="edit-path" name="path" placeholder="src/module.rs" autocomplete="off" spellcheck="false" required></label>
+                <label class="content-label">Proposed file content<textarea id="edit-content" name="content" rows="5" placeholder="Paste the complete new file content…" required></textarea></label>
+              </div>
+              <div class="edit-actions"><label class="attach-task"><input type="checkbox" id="attach-task" checked><span class="checkbox-ui"></span> Link to selected run <span id="attached-run">(none)</span></label><button id="preview-button" class="secondary-button" type="submit">Create diff preview <span>→</span></button></div>
+            </form>
+            <div id="diff-panel" class="diff-panel" hidden>
+              <div class="diff-header"><span><span class="diff-symbol">±</span> PERSISTED DIFF PREVIEW</span><span id="diff-file"></span></div>
+              <pre id="diff-content" class="diff-content"></pre>
+              <div class="diff-footer"><span id="diff-hash"></span><button id="apply-edit" class="apply-button">Apply this edit <span>↗</span></button></div>
+            </div>
+            <div class="edit-message" id="edit-message" role="status" hidden></div>
+          </section>
+          <footer class="main-footer"><span>DEVPILOT <span class="footer-version">/ AGENT CONSOLE</span></span><span>LOCAL BY DEFAULT <span class="footer-dot">●</span></span></footer>
+        </main>
+      </div>
+    </div>
+  </body>
+</html>
