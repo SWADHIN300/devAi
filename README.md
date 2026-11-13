@@ -1,6 +1,6 @@
 # DevPilot CLI
 
-A local-first Rust CLI and Python planning service for exploring software projects. The `task` command asks a local Ollama model for a read-only plan; the CLI does not modify files or execute project commands.
+A local-first Rust CLI and Python agent service for exploring software projects. It provides bounded workspace read/search tools, diff previews with explicit approval before edits, and Docker-isolated project command execution with timeouts and retries.
 
 ## Commands
 
@@ -14,20 +14,21 @@ cargo run -- task "Add a health endpoint" --workspace .
 
 Paths passed to `read` and `search` are resolved beneath the selected workspace. The scanner skips common generated and dependency directories.
 
-`task` sends the request and a bounded workspace summary to the local FastAPI service. The summary contains a file listing and up to six relevant text files (48 KB total); `.env` files and files whose names suggest secrets or credentials are excluded. FastAPI calls Ollama and returns a plan. Set `DEVPILOT_AGENT_URL` (default `http://127.0.0.1:8000`), `DEVPILOT_OLLAMA_URL` (default `http://127.0.0.1:11434`), and `DEVPILOT_OLLAMA_MODEL` (default `qwen2.5-coder:7b`) to configure the local services. The model must already be installed (`ollama pull <model>`). The command only prints a plan; it does not edit files or run commands.
+`task` sends the request and a bounded workspace summary to the local FastAPI service, which sends that summary to OpenRouter. The summary contains a file listing and up to six relevant text files (48 KB total); `.env` files and files whose names suggest secrets or credentials are excluded. Set `DEVPILOT_AGENT_URL` (default `http://127.0.0.1:8000`), `OPENROUTER_API_KEY`, and optionally `DEVPILOT_MODEL` (default `particle-ai/particle-1:free`) to configure the service. The model uses OpenRouter's chat-completions API; no local model download is needed. OpenRouter's free models are rate limited and provider availability can vary.
+
+The API exposes `POST /v1/tools/read` and `/v1/tools/search` for bounded, validated workspace access. Secret-like files and symlinks are rejected. Edits use `POST /v1/edits/preview` to produce a unified diff and source hash, followed by `POST /v1/edits/apply` with `approved: true`; stale previews are rejected. `POST /v1/tools/run` executes an argument-vector command in Docker with networking disabled, a 2 GB memory limit, two CPUs, a timeout, and up to three retries. Docker must be installed and its daemon running. Keep the API bound to localhost; do not expose it to an untrusted network.
 
 ## Run the planning service on Windows
 
-Install Python 3.12 or newer, then from PowerShell:
+Install Python 3.12 or newer and Docker Desktop, and create an OpenRouter API key. Then from PowerShell:
 
 ```powershell
 cd C:\Users\swadh\Ai\agent
 $Python = "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe"
 & $Python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-$env:DEVPILOT_OLLAMA_URL = "http://127.0.0.1:11434"
-$env:DEVPILOT_OLLAMA_MODEL = "qwen2.5-coder:7b"
-ollama pull $env:DEVPILOT_OLLAMA_MODEL
+$env:OPENROUTER_API_KEY = "<your-key>"
+$env:DEVPILOT_MODEL = "particle-ai/particle-1:free"
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
@@ -39,7 +40,7 @@ $env:DEVPILOT_AGENT_URL = "http://127.0.0.1:8000"
 cargo run -- task "Add a health endpoint" --workspace .
 ```
 
-Run the API tests from `agent` with `.\.venv\Scripts\python.exe -m pytest -q` and the Rust tests from the repository root with `cargo test`.
+Run the API tests from `agent` with `.\.venv\Scripts\python.exe -m pytest -q`. On Windows, install the Visual Studio 2022 C++ Build Tools workload and run Rust tests from a Visual Studio Developer PowerShell with `cargo test`.
 
 ## Development
 

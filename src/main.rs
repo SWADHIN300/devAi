@@ -100,9 +100,9 @@ fn print_help() {
          list [workspace]          List project files\n\
          read <file>               Print a UTF-8 file under the current directory\n\
          search <text> [workspace] Find matching lines in project files\n\
-         task <request> [--workspace <path>] Preview a read-only plan for a task\n\
+         task <request> [--workspace <path>] Preview an agent plan for a task\n\
          help                      Show this help\n\n\
-         No files are modified and no project commands are executed."
+         Plans never apply file changes. Test commands may run in network-disabled Docker."
     );
 }
 
@@ -143,11 +143,11 @@ fn show_task_plan(root: &Path, request: &str) -> Result<(), String> {
     let summary = workspace_summary(root, &files, request);
     let service_url =
         env::var("DEVPILOT_AGENT_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".into());
-    let (plan, model) = request_plan(&service_url, request, &summary)?;
+    let (plan, model) = request_plan(&service_url, request, &summary, root)?;
     println!("Task: {request}");
     println!("Workspace: {}", root.display());
     println!("Planning model: {model}");
-    println!("\nModel plan (read-only; no files changed and no commands run):\n{plan}");
+    println!("\nModel plan (files are not changed; tests may run in Docker):\n{plan}");
     Ok(())
 }
 
@@ -311,7 +311,12 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> &str {
     &text[..end]
 }
 
-fn request_plan(base_url: &str, request: &str, summary: &str) -> Result<(String, String), String> {
+fn request_plan(
+    base_url: &str,
+    request: &str,
+    summary: &str,
+    root: &Path,
+) -> Result<(String, String), String> {
     let base = base_url.trim_end_matches('/');
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(180))
@@ -321,7 +326,8 @@ fn request_plan(base_url: &str, request: &str, summary: &str) -> Result<(String,
         .post(format!("{base}/v1/plan"))
         .json(&serde_json::json!({
             "task": request,
-            "workspace_summary": summary
+            "workspace_summary": summary,
+            "workspace_root": root
         }))
         .send()
         .map_err(|e| {
@@ -331,7 +337,7 @@ fn request_plan(base_url: &str, request: &str, summary: &str) -> Result<(String,
         })?;
     if !response.status().is_success() {
         return Err(format!(
-            "DevPilot planning service returned HTTP {}. Check its output for Ollama details.",
+            "DevPilot planning service returned HTTP {}. Check its output for provider details.",
             response.status(),
         ));
     }
@@ -574,6 +580,7 @@ mod tests {
             &format!("http://{address}"),
             "Add a health endpoint",
             "Files: src/main.rs",
+            Path::new("."),
         )
         .unwrap();
         let request = server.join().unwrap();
@@ -583,6 +590,7 @@ mod tests {
         assert!(request.starts_with("POST /v1/plan HTTP/1.1"));
         assert_eq!(payload["task"], "Add a health endpoint");
         assert_eq!(payload["workspace_summary"], "Files: src/main.rs");
+        assert!(payload["workspace_root"].is_string());
         assert_eq!(plan, "1. Inspect the route.\n2. Add the endpoint.");
         assert_eq!(model, "test-model");
     }
