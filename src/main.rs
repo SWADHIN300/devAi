@@ -143,10 +143,11 @@ fn show_task_plan(root: &Path, request: &str) -> Result<(), String> {
     let summary = workspace_summary(root, &files, request);
     let service_url =
         env::var("DEVPILOT_AGENT_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".into());
-    let (plan, model) = request_plan(&service_url, request, &summary, root)?;
+    let (plan, model, run_id) = request_plan(&service_url, request, &summary, root)?;
     println!("Task: {request}");
     println!("Workspace: {}", root.display());
     println!("Planning model: {model}");
+    println!("Plan run: {run_id} (approval required before linked edits)");
     println!("\nModel plan (files are not changed; tests may run in Docker):\n{plan}");
     Ok(())
 }
@@ -316,7 +317,7 @@ fn request_plan(
     request: &str,
     summary: &str,
     root: &Path,
-) -> Result<(String, String), String> {
+) -> Result<(String, String, String), String> {
     let base = base_url.trim_end_matches('/');
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(180))
@@ -354,7 +355,12 @@ fn request_plan(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("unknown")
         .to_string();
-    Ok((plan, model))
+    let run_id = result["run_id"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "DevPilot planning service returned no task run ID".to_string())?
+        .to_string();
+    Ok((plan, model, run_id))
 }
 
 fn workspace_arg(arg: Option<&String>) -> Result<PathBuf, String> {
@@ -564,8 +570,7 @@ mod tests {
                     }
                 }
             }
-            let body =
-                r#"{"plan":"1. Inspect the route.\n2. Add the endpoint.","model":"test-model"}"#;
+            let body = r#"{"run_id":"run-123","plan":"1. Inspect the route.\n2. Add the endpoint.","model":"test-model"}"#;
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -576,7 +581,7 @@ mod tests {
             String::from_utf8(request).unwrap()
         });
 
-        let (plan, model) = request_plan(
+        let (plan, model, run_id) = request_plan(
             &format!("http://{address}"),
             "Add a health endpoint",
             "Files: src/main.rs",
@@ -593,5 +598,6 @@ mod tests {
         assert!(payload["workspace_root"].is_string());
         assert_eq!(plan, "1. Inspect the route.\n2. Add the endpoint.");
         assert_eq!(model, "test-model");
+        assert_eq!(run_id, "run-123");
     }
 }
