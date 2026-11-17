@@ -15,7 +15,7 @@ import { browse } from "./browser.js";
 
 const app=Fastify({logger:true});
 app.setErrorHandler((error, _request, reply)=>{const status=(error as Error&{statusCode?:number}).statusCode||((error as Error).name==="ZodError"?422:500);reply.code(status).send({detail:error.message});});
-const here=dirname(fileURLToPath(import.meta.url)), staticDir=resolve(here,"../../agent/app/static");
+const here=dirname(fileURLToPath(import.meta.url)), staticDir=resolve(here,"../static");
 await app.register(fastifyStatic,{root:staticDir,prefix:"/static/"});
 const obj=z.object({workspace_root:z.string().min(1).max(4000)}), planSchema=z.object({task:z.string().min(1).max(8000),workspace_summary:z.string().max(65000).default(""),workspace_root:z.string().min(1).max(4000).default("."),api_key:z.string().max(512).optional(),provider:z.string().max(32).optional()});
 app.get("/",async(_req,reply)=>reply.sendFile("index.html"));app.get("/health",async()=>({status:"ok"}));

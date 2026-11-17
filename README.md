@@ -43,9 +43,8 @@ $env:DEVPILOT_MODEL = "particle-ai/particle-1:free"
 npm start
 ```
 
-The TypeScript service listens at `http://127.0.0.1:8000` by default, preserving the Rust CLI's service URL and REST API. Set `PORT` or `HOST` to change the bind address. Node's built-in SQLite module stores state at the same default path as the former Python service.
+The TypeScript service listens at `http://127.0.0.1:8000` by default, preserving the Rust CLI's service URL and REST API. Set `PORT` or `HOST` to change the bind address. Node's built-in SQLite module stores state at the same default path as the previous service.
 
-The original Python implementation remains in `agent/` during migration. Its pytest suite can still be run from that directory with the existing virtual environment.
 ## Development
 
 ```powershell
