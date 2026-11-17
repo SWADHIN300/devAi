@@ -46,6 +46,7 @@ class PlanRequest(BaseModel):
     workspace_summary: str = Field(default="", max_length=65_000)
     workspace_root: str = Field(default=".", max_length=4_000)
     api_key: SecretStr | None = Field(default=None, max_length=512, repr=False)
+    provider: str | None = Field(default=None, max_length=32)
 
     @field_validator("task")
     @classmethod
@@ -53,6 +54,18 @@ class PlanRequest(BaseModel):
         if not value.strip():
             raise ValueError("task cannot be blank")
         return value.strip()
+
+    @field_validator("provider")
+    @classmethod
+    def provider_must_be_supported(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        provider = value.strip().lower()
+        if provider == "claude":
+            provider = "anthropic"
+        if provider not in {"openrouter", "openai", "codex", "anthropic", "nvidia"}:
+            raise ValueError("provider must be openrouter, openai, codex, claude, or nvidia")
+        return provider
 
 
 class PlanResponse(BaseModel):
@@ -73,7 +86,13 @@ async def create_plan(payload: PlanRequest) -> PlanResponse:
     store = StateStore()
     task_id = store.create_run(payload.task, payload.workspace_root)
     try:
-        if payload.api_key:
+        if payload.provider:
+            plan, model = await generate_plan(
+                payload.task, payload.workspace_summary, payload.workspace_root, task_id,
+                api_key=payload.api_key.get_secret_value() if payload.api_key else None,
+                provider=payload.provider,
+            )
+        elif payload.api_key:
             plan, model = await generate_plan(
                 payload.task, payload.workspace_summary, payload.workspace_root, task_id,
                 api_key=payload.api_key.get_secret_value(),

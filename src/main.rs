@@ -51,6 +51,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "--version" | "-V" => println!("devpilot {}", env!("CARGO_PKG_VERSION")),
         "login" => login()?,
         "logout" => logout()?,
+        "provider" => configure_provider(args.get(1).map(String::as_str))?,
         "analyze" => {
             let root = workspace_arg(args.get(1))?;
             analyze(&root)?;
@@ -139,7 +140,7 @@ fn run_tui() -> Result<(), String> {
     let mut terminal = Terminal::new(backend).map_err(|e| e.to_string())?;
     let mut input = String::new();
     let mut messages: Vec<(bool, String)> = Vec::new();
-    let provider = env::var("DEVPILOT_PROVIDER").unwrap_or_else(|_| "openrouter".into());
+    let provider = selected_provider()?;
     let mut status = format!("Ready · {provider} · plans require approval before any edits");
     let root = env::current_dir().map_err(|e| e.to_string())?;
 
@@ -273,7 +274,7 @@ fn run_tui() -> Result<(), String> {
                         let summary = workspace_summary(&root, &files, &request);
                         let url = env::var("DEVPILOT_AGENT_URL")
                             .unwrap_or_else(|_| "http://127.0.0.1:8000".into());
-                        request_plan(&url, &request, &summary, &root, &api_key)
+                        request_plan(&url, &request, &summary, &root, &api_key, &provider)
                     });
                     match result {
                         Ok((plan, model, run_id)) => {
@@ -326,9 +327,49 @@ fn analyze_summary(root: &Path) -> Result<String, String> {
 }
 
 fn credential_entry() -> Result<keyring::Entry, String> {
-    let provider = env::var("DEVPILOT_PROVIDER").unwrap_or_else(|_| "openrouter".into());
+    let provider = selected_provider()?;
     keyring::Entry::new("DevPilot", &format!("{}_api_key", provider.to_lowercase()))
         .map_err(|e| format!("cannot access the system credential store: {e}"))
+}
+
+fn selected_provider() -> Result<String, String> {
+    let provider = if let Ok(provider) = env::var("DEVPILOT_PROVIDER") {
+        provider
+    } else {
+        match keyring::Entry::new("DevPilot", "selected_provider")
+            .map_err(|e| format!("cannot access the system credential store: {e}"))?
+            .get_password()
+        {
+            Ok(provider) => provider,
+            Err(keyring::Error::NoEntry) => "openrouter".into(),
+            Err(error) => return Err(format!("cannot read selected provider: {error}")),
+        }
+    };
+    let provider = provider.to_lowercase();
+    match provider.as_str() {
+        "claude" => Ok("anthropic".into()),
+        "openrouter" | "openai" | "codex" | "anthropic" | "nvidia" => Ok(provider),
+        _ => Err(format!("unsupported provider '{provider}'. Choose openrouter, openai, codex, claude, or nvidia.")),
+    }
+}
+
+fn configure_provider(provider: Option<&str>) -> Result<(), String> {
+    let Some(provider) = provider else {
+        println!("Selected provider: {}", selected_provider()?);
+        println!("Choose with: devpilot provider openrouter|openai|codex|claude|nvidia");
+        return Ok(());
+    };
+    let provider = match provider.to_lowercase().as_str() {
+        "claude" => "anthropic".to_string(),
+        "openrouter" | "openai" | "codex" | "anthropic" | "nvidia" => provider.to_lowercase(),
+        _ => return Err("provider must be openrouter, openai, codex, claude, or nvidia".into()),
+    };
+    keyring::Entry::new("DevPilot", "selected_provider")
+        .map_err(|e| format!("cannot access the system credential store: {e}"))?
+        .set_password(&provider)
+        .map_err(|e| format!("cannot save selected provider: {e}"))?;
+    println!("Provider set to {provider}. Sign in with `devpilot login` to save its API key.");
+    Ok(())
 }
 
 fn load_auth_key() -> Result<Option<String>, String> {
@@ -412,9 +453,7 @@ fn auth_prompt() -> Result<AuthChoice, String> {
     let mut selected = 0usize;
     let mut entering_key = false;
     let mut api_key = String::new();
-    let oauth_available = env::var("DEVPILOT_PROVIDER")
-        .unwrap_or_else(|_| "openrouter".into())
-        .eq_ignore_ascii_case("openrouter");
+    let oauth_available = selected_provider()?.eq("openrouter");
     if !oauth_available {
         selected = 1;
     }
@@ -449,7 +488,7 @@ fn auth_prompt() -> Result<AuthChoice, String> {
                             white,
                         )),
                         Line::from(""),
-                        Line::from(format!("↑ ↓ select · Enter continue · Esc quit · provider: {}", env::var("DEVPILOT_PROVIDER").unwrap_or_else(|_| "openrouter".into()))),
+                        Line::from(format!("↑ ↓ select · Enter continue · Esc quit · provider: {}", selected_provider().unwrap_or_else(|_| "openrouter".into()))),
                     ];
                     if oauth_available {
                         options.insert(4, Line::from(Span::styled(
@@ -617,27 +656,9 @@ fn validate_api_key(key: &str) -> Result<(), String> {
     if key.trim().is_empty() {
         return Err("API key cannot be empty".into());
     }
-    if env::var("DEVPILOT_PROVIDER").unwrap_or_else(|_| "openrouter".into()).to_lowercase() != "openrouter" {
-        return Ok(());
-    }
-    let response = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("cannot create API-key validator: {e}"))?
-        .get("https://openrouter.ai/api/v1/key")
-        .bearer_auth(key)
-        .send()
-        .map_err(|e| format!("could not validate API key: {e}"))?;
-    if response.status().is_success() {
-        Ok(())
-    } else if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        Err("OpenRouter rejected this key. Use an OpenRouter API key, not a key from another provider.".into())
-    } else {
-        Err(format!(
-            "OpenRouter could not validate this key (HTTP {})",
-            response.status()
-        ))
-    }
+    // Provider-specific keys cannot be validated against one shared endpoint.
+    // Save any non-empty key here; the selected provider validates it on use.
+    Ok(())
 }
 
 fn logout() -> Result<(), String> {
@@ -658,6 +679,7 @@ fn print_help() {
          Commands:\n\
          login                     Sign in with OpenRouter account or API key\n\
          logout                    Remove saved sign-in\n\
+         provider [name]           Show or select an AI provider\n\
          analyze [workspace]       Summarize project files and common manifests\n\
          list [workspace]          List project files\n\
          read <file>               Print a UTF-8 file under the current directory\n\
@@ -705,7 +727,8 @@ fn show_task_plan(root: &Path, request: &str, api_key: &str) -> Result<(), Strin
     let summary = workspace_summary(root, &files, request);
     let service_url =
         env::var("DEVPILOT_AGENT_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".into());
-    let (plan, model, run_id) = request_plan(&service_url, request, &summary, root, api_key)?;
+    let provider = selected_provider()?;
+    let (plan, model, run_id) = request_plan(&service_url, request, &summary, root, api_key, &provider)?;
     println!("Task: {request}");
     println!("Workspace: {}", root.display());
     println!("Planning model: {model}");
@@ -880,6 +903,7 @@ fn request_plan(
     summary: &str,
     root: &Path,
     api_key: &str,
+    provider: &str,
 ) -> Result<(String, String, String), String> {
     let base = base_url.trim_end_matches('/');
     let parsed_base =
@@ -904,12 +928,13 @@ fn request_plan(
             "task": request,
             "workspace_summary": summary,
             "workspace_root": root,
-            "api_key": api_key
+            "api_key": api_key,
+            "provider": provider
         }))
         .send()
         .map_err(|e| {
             format!(
-                "DevPilot planning service is unavailable at {base} ({e}). Start it with `python -m uvicorn app.main:app --app-dir agent --host 127.0.0.1 --port 8000` or set DEVPILOT_AGENT_URL."
+                "DevPilot planning service is unavailable at {base} ({e}). Start the TypeScript service from `agent-ts` with `npm start` or set DEVPILOT_AGENT_URL."
             )
         })?;
     if !response.status().is_success() {
@@ -1177,6 +1202,7 @@ mod tests {
             "Files: src/main.rs",
             Path::new("."),
             "sk-or-test",
+            "openrouter",
         )
         .unwrap();
         let request = server.join().unwrap();
@@ -1188,6 +1214,7 @@ mod tests {
         assert_eq!(payload["workspace_summary"], "Files: src/main.rs");
         assert!(payload["workspace_root"].is_string());
         assert_eq!(payload["api_key"], "sk-or-test");
+        assert_eq!(payload["provider"], "openrouter");
         assert_eq!(plan, "1. Inspect the route.\n2. Add the endpoint.");
         assert_eq!(model, "test-model");
         assert_eq!(run_id, "run-123");

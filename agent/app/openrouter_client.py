@@ -23,8 +23,10 @@ class OpenRouterSettings:
     api_key: str
 
     @classmethod
-    def from_env(cls, api_key_override: str | None = None) -> "OpenRouterSettings":
-        provider = os.getenv("DEVPILOT_PROVIDER", "openrouter").strip().lower()
+    def from_env(
+        cls, api_key_override: str | None = None, provider_override: str | None = None
+    ) -> "OpenRouterSettings":
+        provider = (provider_override or os.getenv("DEVPILOT_PROVIDER", "openrouter")).strip().lower()
         defaults = {
             "openrouter": ("https://openrouter.ai/api/v1", "particle-ai/particle-1:free", "OPENROUTER_API_KEY"),
             "openai": ("https://api.openai.com/v1", "gpt-5.3-codex", "OPENAI_API_KEY"),
@@ -37,7 +39,12 @@ class OpenRouterSettings:
         base_default, model_default, key_name = defaults[provider]
         override_url = os.getenv(f"DEVPILOT_{provider.upper()}_URL")
         base_url = (override_url or base_default).rstrip("/")
-        model = os.getenv("DEVPILOT_MODEL", model_default).strip()
+        provider_model = os.getenv(f"DEVPILOT_{provider.upper()}_MODEL")
+        configured_provider = os.getenv("DEVPILOT_PROVIDER", "openrouter").strip().lower()
+        shared_model = os.getenv("DEVPILOT_MODEL")
+        if provider_override and configured_provider != provider:
+            shared_model = None
+        model = (provider_model or shared_model or model_default).strip()
         legacy_key = os.getenv("DEVPILOT_OPENROUTER_API_KEY", "") if provider == "openrouter" else ""
         api_key = (api_key_override or os.getenv(key_name, legacy_key)).strip()
         if not base_url.startswith("https://"):
@@ -154,9 +161,9 @@ async def _call_tool(name: str, raw_arguments: str, workspace_root: str, task_id
 
 async def generate_plan(
     task: str, workspace_summary: str, workspace_root: str = ".", task_id: str | None = None,
-    api_key: str | None = None,
+    api_key: str | None = None, provider: str | None = None,
 ) -> tuple[str, str]:
-    settings = OpenRouterSettings.from_env(api_key)
+    settings = OpenRouterSettings.from_env(api_key, provider)
     timeout = httpx.Timeout(120.0, connect=10.0)
     messages = [
         {"role": "system", "content": (
