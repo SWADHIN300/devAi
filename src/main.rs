@@ -1,8 +1,10 @@
 use std::env;
 use std::fs;
 use std::io::{self, Read};
+use std::net::TcpListener;
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 const SKIP_DIRS: &[&str] = &[
     ".git",
@@ -15,6 +17,11 @@ const SKIP_DIRS: &[&str] = &[
     ".venv",
     "venv",
     "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".cache",
     ".next",
     ".turbo",
 ];
@@ -42,6 +49,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
     match command {
         "help" | "--help" | "-h" => print_help(),
         "--version" | "-V" => println!("devpilot {}", env!("CARGO_PKG_VERSION")),
+        "login" => login()?,
+        "logout" => logout()?,
         "analyze" => {
             let root = workspace_arg(args.get(1))?;
             analyze(&root)?;
@@ -82,7 +91,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "task" => {
             let (request, workspace) = parse_task_args(&args[1..])?;
             let root = workspace_arg(workspace.as_ref())?;
-            show_task_plan(&root, &request)?;
+            let api_key = require_auth_key()?;
+            show_task_plan(&root, &request, &api_key)?;
         }
         _ => return Err(format!("unknown command '{command}'. Run `devpilot help`.")),
     }
@@ -91,17 +101,25 @@ fn run(args: Vec<String>) -> Result<(), String> {
 
 fn run_tui() -> Result<(), String> {
     use crossterm::{
-        event::{self, Event, KeyCode, KeyModifiers},
-        terminal::{enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
         ExecutableCommand,
+        event::{self, Event, KeyCode, KeyModifiers},
+        terminal::{EnterAlternateScreen, LeaveAlternateScreen, enable_raw_mode},
     };
     use ratatui::{
+        Terminal,
         backend::CrosstermBackend,
         layout::{Constraint, Direction, Layout},
         style::{Color, Modifier, Style},
         text::{Line, Span, Text},
         widgets::{Block, Borders, Clear, Paragraph, Wrap},
-        Terminal,
+    };
+
+    let api_key = match load_auth_key()? {
+        Some(key) => key,
+        None => {
+            println!("Sign in to DevPilot.\n");
+            login_flow()?
+        }
     };
 
     struct TerminalSession;
@@ -121,7 +139,8 @@ fn run_tui() -> Result<(), String> {
     let mut terminal = Terminal::new(backend).map_err(|e| e.to_string())?;
     let mut input = String::new();
     let mut messages: Vec<(bool, String)> = Vec::new();
-    let mut status = "Ready · plans require approval before any edits".to_string();
+    let provider = env::var("DEVPILOT_PROVIDER").unwrap_or_else(|_| "openrouter".into());
+    let mut status = format!("Ready · {provider} · plans require approval before any edits");
     let root = env::current_dir().map_err(|e| e.to_string())?;
 
     loop {
@@ -147,9 +166,9 @@ fn run_tui() -> Result<(), String> {
                         Line::from(Span::styled("What are we building today?", white.add_modifier(Modifier::BOLD))),
                         Line::from("Describe a task and DevPilot will inspect this workspace and draft a plan."),
                         Line::from(""),
-                        Line::from("  /help     keyboard shortcuts and commands"),
-                        Line::from("  /analyze  summarize this workspace"),
-                        Line::from("  /files    list project files"),
+                        Line::from("  /help     │  keyboard shortcuts and commands"),
+                        Line::from("  /analyze  │  summarize this workspace      "),
+                        Line::from("  /files    │  list project files            "),
                     ]))
                     .style(white)
                     .alignment(ratatui::layout::Alignment::Center)
@@ -193,15 +212,25 @@ fn run_tui() -> Result<(), String> {
             match key.code {
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                 KeyCode::Esc => break,
-                KeyCode::Backspace => { input.pop(); }
-                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => input.push(ch),
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    input.push(ch)
+                }
                 KeyCode::Enter => {
                     let request = input.trim().to_string();
                     input.clear();
-                    if request.is_empty() { continue; }
+                    if request.is_empty() {
+                        continue;
+                    }
                     match request.as_str() {
                         "/quit" | "/exit" => break,
-                        "/clear" => { messages.clear(); status = "Session cleared".into(); continue; }
+                        "/clear" => {
+                            messages.clear();
+                            status = "Session cleared".into();
+                            continue;
+                        }
                         "/help" => {
                             messages.push((false, "Type a task to generate a plan. Commands: /analyze, /files, /clear, /quit. Esc or Ctrl+C exits.".into()));
                             continue;
@@ -216,9 +245,21 @@ fn run_tui() -> Result<(), String> {
                         "/files" => {
                             match collect_files(&root) {
                                 Ok(files) => {
-                                    let shown = files.iter().take(100).map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n");
-                                    let suffix = if files.len() > 100 { format!("\n… and {} more", files.len() - 100) } else { String::new() };
-                                    messages.push((false, format!("{} files\n{}{}", files.len(), shown, suffix)));
+                                    let shown = files
+                                        .iter()
+                                        .take(100)
+                                        .map(|p| p.display().to_string())
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    let suffix = if files.len() > 100 {
+                                        format!("\n… and {} more", files.len() - 100)
+                                    } else {
+                                        String::new()
+                                    };
+                                    messages.push((
+                                        false,
+                                        format!("{} files\n{}{}", files.len(), shown, suffix),
+                                    ));
                                 }
                                 Err(error) => messages.push((false, format!("Error: {error}"))),
                             }
@@ -230,8 +271,9 @@ fn run_tui() -> Result<(), String> {
                     let files = collect_files(&root);
                     let result = files.and_then(|files| {
                         let summary = workspace_summary(&root, &files, &request);
-                        let url = env::var("DEVPILOT_AGENT_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".into());
-                        request_plan(&url, &request, &summary, &root)
+                        let url = env::var("DEVPILOT_AGENT_URL")
+                            .unwrap_or_else(|_| "http://127.0.0.1:8000".into());
+                        request_plan(&url, &request, &summary, &root, &api_key)
                     });
                     match result {
                         Ok((plan, model, run_id)) => {
@@ -253,12 +295,359 @@ fn run_tui() -> Result<(), String> {
 
 fn analyze_summary(root: &Path) -> Result<String, String> {
     let files = collect_files(root)?;
-    let manifests = ["Cargo.toml", "package.json", "pyproject.toml", "requirements.txt", "go.mod", "README.md"];
-    let found = files.iter().filter_map(|path| {
-        let text = path.to_string_lossy();
-        manifests.iter().find(|name| text.as_ref() == **name).map(|name| (*name).to_string())
-    }).collect::<Vec<_>>();
-    Ok(format!("Workspace: {}\nFiles: {}\nProject files: {}", root.display(), files.len(), if found.is_empty() { "none detected".into() } else { found.join(", ") }))
+    let manifests = [
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "requirements.txt",
+        "go.mod",
+        "README.md",
+    ];
+    let found = files
+        .iter()
+        .filter_map(|path| {
+            let text = path.to_string_lossy();
+            manifests
+                .iter()
+                .find(|name| text.as_ref() == **name)
+                .map(|name| (*name).to_string())
+        })
+        .collect::<Vec<_>>();
+    Ok(format!(
+        "Workspace: {}\nFiles: {}\nProject files: {}",
+        root.display(),
+        files.len(),
+        if found.is_empty() {
+            "none detected".into()
+        } else {
+            found.join(", ")
+        }
+    ))
+}
+
+fn credential_entry() -> Result<keyring::Entry, String> {
+    let provider = env::var("DEVPILOT_PROVIDER").unwrap_or_else(|_| "openrouter".into());
+    keyring::Entry::new("DevPilot", &format!("{}_api_key", provider.to_lowercase()))
+        .map_err(|e| format!("cannot access the system credential store: {e}"))
+}
+
+fn load_auth_key() -> Result<Option<String>, String> {
+    match credential_entry()?.get_password() {
+        Ok(key) if !key.trim().is_empty() => Ok(Some(key)),
+        Ok(_) | Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(format!("cannot read the saved sign-in: {error}")),
+    }
+}
+
+fn require_auth_key() -> Result<String, String> {
+    load_auth_key()?.ok_or_else(|| "sign in first with `devpilot login`".into())
+}
+
+fn login() -> Result<(), String> {
+    if load_auth_key()?.is_some() {
+        println!("Already signed in. Run `devpilot logout` to switch accounts.");
+        return Ok(());
+    }
+    login_flow()?;
+    println!("Sign-in saved in the operating system credential store.");
+    Ok(())
+}
+
+fn login_flow() -> Result<String, String> {
+    let key = match auth_prompt()? {
+        AuthChoice::Account => oauth_login()?,
+        AuthChoice::ApiKey(key) => {
+            validate_api_key(&key)?;
+            key
+        }
+    };
+    credential_entry()?
+        .set_password(&key)
+        .map_err(|e| format!("cannot save sign-in to the system credential store: {e}"))?;
+    Ok(key)
+}
+
+enum AuthChoice {
+    Account,
+    ApiKey(String),
+}
+
+fn auth_prompt() -> Result<AuthChoice, String> {
+    use crossterm::{
+        ExecutableCommand,
+        event::{self, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers},
+        terminal::{EnterAlternateScreen, enable_raw_mode},
+    };
+    use ratatui::{
+        Terminal,
+        backend::CrosstermBackend,
+        layout::{Alignment, Constraint, Direction, Layout},
+        style::{Color, Modifier, Style},
+        text::{Line, Span},
+        widgets::{Block, Borders, Paragraph},
+    };
+
+    struct AuthTerminal;
+    impl Drop for AuthTerminal {
+        fn drop(&mut self) {
+            use crossterm::{
+                ExecutableCommand, event::DisableBracketedPaste, terminal::LeaveAlternateScreen,
+            };
+            let _ = crossterm::terminal::disable_raw_mode();
+            let mut stdout = io::stdout();
+            let _ = stdout.execute(DisableBracketedPaste);
+            let _ = stdout.execute(LeaveAlternateScreen);
+        }
+    }
+
+    enable_raw_mode().map_err(|e| format!("cannot start sign-in screen: {e}"))?;
+    let _session = AuthTerminal;
+    let mut stdout = io::stdout();
+    stdout
+        .execute(EnterAlternateScreen)
+        .and_then(|out| out.execute(EnableBracketedPaste))
+        .map_err(|e| format!("cannot open sign-in screen: {e}"))?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).map_err(|e| e.to_string())?;
+    let mut selected = 0usize;
+    let mut entering_key = false;
+    let mut api_key = String::new();
+    let oauth_available = env::var("DEVPILOT_PROVIDER")
+        .unwrap_or_else(|_| "openrouter".into())
+        .eq_ignore_ascii_case("openrouter");
+    if !oauth_available {
+        selected = 1;
+    }
+    let white = Style::default().fg(Color::White).bg(Color::Black);
+
+    loop {
+        terminal
+            .draw(|frame| {
+                let rows = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(2), Constraint::Length(1)])
+                    .split(frame.area());
+                let content = if entering_key {
+                    let mask = "•".repeat(api_key.chars().count().min(72));
+                    vec![
+                        Line::from(Span::styled("DEVPILOT", white.add_modifier(Modifier::BOLD))),
+                        Line::from(""),
+                        Line::from("Paste API key"),
+                        Line::from(""),
+                        Line::from(Span::styled(format!("  {mask}"), white)),
+                        Line::from(""),
+                        Line::from("Enter continue · Esc back"),
+                    ]
+                } else {
+                    let mut options = vec![
+                        Line::from(Span::styled("DEVPILOT", white.add_modifier(Modifier::BOLD))),
+                        Line::from(""),
+                        Line::from("Sign in"),
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            format!("{} API key", if selected == 1 { "›" } else { " " }),
+                            white,
+                        )),
+                        Line::from(""),
+                        Line::from(format!("↑ ↓ select · Enter continue · Esc quit · provider: {}", env::var("DEVPILOT_PROVIDER").unwrap_or_else(|_| "openrouter".into()))),
+                    ];
+                    if oauth_available {
+                        options.insert(4, Line::from(Span::styled(
+                            format!("{} Account", if selected == 0 { "›" } else { " " }),
+                            white,
+                        )));
+                    }
+                    options
+                };
+                let card = Paragraph::new(content)
+                    .style(white)
+                    .alignment(Alignment::Center)
+                    .block(Block::default().borders(Borders::ALL).border_style(white));
+                frame.render_widget(card, rows[0]);
+                frame.render_widget(Paragraph::new("API key for the configured provider").style(white), rows[1]);
+            })
+            .map_err(|e| e.to_string())?;
+
+        match event::read().map_err(|e| e.to_string())? {
+            Event::Paste(text) if entering_key => {
+                api_key.push_str(text.trim());
+            }
+            Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
+                KeyCode::Esc if entering_key => {
+                    entering_key = false;
+                    api_key.clear();
+                }
+                KeyCode::Esc => return Err("sign-in cancelled".into()),
+                KeyCode::Up | KeyCode::Down if !entering_key && oauth_available => selected = 1 - selected,
+                KeyCode::Up | KeyCode::Down if !entering_key => selected = 1,
+                KeyCode::Char('1') if !entering_key && oauth_available => selected = 0,
+                KeyCode::Char('1') if !entering_key => selected = 1,
+                KeyCode::Char('2') if !entering_key => selected = 1,
+                KeyCode::Enter if entering_key && !api_key.trim().is_empty() => {
+                    return Ok(AuthChoice::ApiKey(api_key.trim().to_string()));
+                }
+                KeyCode::Enter if entering_key => {}
+                KeyCode::Enter if selected == 0 => return Ok(AuthChoice::Account),
+                KeyCode::Enter => entering_key = true,
+                KeyCode::Backspace if entering_key => {
+                    api_key.pop();
+                }
+                KeyCode::Char(ch)
+                    if entering_key && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    api_key.push(ch);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
+fn oauth_login() -> Result<String, String> {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use rand::{RngCore, rngs::OsRng};
+    use sha2::{Digest, Sha256};
+
+    let mut random = [0u8; 32];
+    OsRng.fill_bytes(&mut random);
+    let verifier = URL_SAFE_NO_PAD.encode(random);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    OsRng.fill_bytes(&mut random);
+    let state = URL_SAFE_NO_PAD.encode(random);
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| format!("cannot open local sign-in callback: {e}"))?;
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let callback = format!(
+        "http://127.0.0.1:{}/callback",
+        listener.local_addr().map_err(|e| e.to_string())?.port()
+    );
+    let mut auth_url = url::Url::parse("https://openrouter.ai/auth").map_err(|e| e.to_string())?;
+    auth_url
+        .query_pairs_mut()
+        .append_pair("callback_url", &callback)
+        .append_pair("code_challenge", &challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("key_label", "DevPilot")
+        .append_pair("state", &state);
+
+    println!("Opening OpenRouter sign-in in your browser…");
+    webbrowser::open(auth_url.as_str())
+        .map_err(|e| format!("could not open browser ({e}); sign-in URL: {auth_url}"))?;
+    println!("Waiting for authorization to return to this terminal…");
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(connection) => break connection,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Err("account sign-in timed out after 10 minutes".into());
+            }
+            Err(error) => return Err(format!("sign-in callback failed: {error}")),
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| e.to_string())?;
+    let mut request = [0u8; 8192];
+    let count = stream
+        .read(&mut request)
+        .map_err(|e| format!("cannot read sign-in callback: {e}"))?;
+    let first_line = String::from_utf8_lossy(&request[..count])
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let path = first_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or("invalid sign-in callback")?;
+    let callback_url = url::Url::parse(&format!(
+        "http://127.0.0.1:{}{}",
+        listener.local_addr().map_err(|e| e.to_string())?.port(),
+        path
+    ))
+    .map_err(|e| format!("invalid sign-in callback URL: {e}"))?;
+    let params: std::collections::HashMap<String, String> =
+        callback_url.query_pairs().into_owned().collect();
+    let page = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\nDevPilot sign-in received. You can return to the terminal.";
+    let _ = std::io::Write::write_all(&mut stream, page.as_bytes());
+    if params.get("state") != Some(&state) {
+        return Err("sign-in state did not match; retry `devpilot login`".into());
+    }
+    if let Some(error) = params.get("error") {
+        return Err(format!("OpenRouter sign-in was not completed: {error}"));
+    }
+    let code = params
+        .get("code")
+        .ok_or("OpenRouter did not return an authorization code")?;
+    let response = reqwest::blocking::Client::new()
+        .post("https://openrouter.ai/api/v1/auth/keys")
+        .json(&serde_json::json!({
+            "code": code,
+            "code_challenge_method": "S256",
+            "code_verifier": verifier
+        }))
+        .send()
+        .map_err(|e| format!("could not exchange account authorization: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "OpenRouter account sign-in failed (HTTP {})",
+            response.status()
+        ));
+    }
+    let body: serde_json::Value = response
+        .json()
+        .map_err(|e| format!("invalid sign-in response: {e}"))?;
+    let key = body["key"]
+        .as_str()
+        .filter(|key| !key.is_empty())
+        .ok_or("OpenRouter returned no API key")?
+        .to_string();
+    validate_api_key(&key)?;
+    Ok(key)
+}
+
+fn validate_api_key(key: &str) -> Result<(), String> {
+    if key.trim().is_empty() {
+        return Err("API key cannot be empty".into());
+    }
+    if env::var("DEVPILOT_PROVIDER").unwrap_or_else(|_| "openrouter".into()).to_lowercase() != "openrouter" {
+        return Ok(());
+    }
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("cannot create API-key validator: {e}"))?
+        .get("https://openrouter.ai/api/v1/key")
+        .bearer_auth(key)
+        .send()
+        .map_err(|e| format!("could not validate API key: {e}"))?;
+    if response.status().is_success() {
+        Ok(())
+    } else if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        Err("OpenRouter rejected this key. Use an OpenRouter API key, not a key from another provider.".into())
+    } else {
+        Err(format!(
+            "OpenRouter could not validate this key (HTTP {})",
+            response.status()
+        ))
+    }
+}
+
+fn logout() -> Result<(), String> {
+    match credential_entry()?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => {
+            println!("Signed out of DevPilot.");
+            Ok(())
+        }
+        Err(error) => Err(format!("cannot remove saved sign-in: {error}")),
+    }
 }
 
 fn print_help() {
@@ -267,6 +656,8 @@ fn print_help() {
          Usage:\n\
          devpilot <command> [arguments]\n\n\
          Commands:\n\
+         login                     Sign in with OpenRouter account or API key\n\
+         logout                    Remove saved sign-in\n\
          analyze [workspace]       Summarize project files and common manifests\n\
          list [workspace]          List project files\n\
          read <file>               Print a UTF-8 file under the current directory\n\
@@ -309,12 +700,12 @@ fn parse_task_args(args: &[String]) -> Result<(String, Option<String>), String> 
     Ok((request, workspace))
 }
 
-fn show_task_plan(root: &Path, request: &str) -> Result<(), String> {
+fn show_task_plan(root: &Path, request: &str, api_key: &str) -> Result<(), String> {
     let files = collect_files(root)?;
     let summary = workspace_summary(root, &files, request);
     let service_url =
         env::var("DEVPILOT_AGENT_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".into());
-    let (plan, model, run_id) = request_plan(&service_url, request, &summary, root)?;
+    let (plan, model, run_id) = request_plan(&service_url, request, &summary, root, api_key)?;
     println!("Task: {request}");
     println!("Workspace: {}", root.display());
     println!("Planning model: {model}");
@@ -488,8 +879,21 @@ fn request_plan(
     request: &str,
     summary: &str,
     root: &Path,
+    api_key: &str,
 ) -> Result<(String, String, String), String> {
     let base = base_url.trim_end_matches('/');
+    let parsed_base =
+        url::Url::parse(base).map_err(|e| format!("invalid planning-service URL: {e}"))?;
+    let local_http = parsed_base.scheme() == "http"
+        && parsed_base.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        });
+    if parsed_base.scheme() != "https" && !local_http {
+        return Err("planning-service URL must use HTTPS unless it points to localhost".into());
+    }
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(180))
         .build()
@@ -499,7 +903,8 @@ fn request_plan(
         .json(&serde_json::json!({
             "task": request,
             "workspace_summary": summary,
-            "workspace_root": root
+            "workspace_root": root,
+            "api_key": api_key
         }))
         .send()
         .map_err(|e| {
@@ -556,11 +961,25 @@ fn collect_files(root: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 fn walk(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
-    let entries = fs::read_dir(dir).map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Ok(());
+        }
+        Err(error) => return Err(format!("cannot list {}: {error}", dir.display())),
+    };
     for entry in entries {
-        let entry = entry.map_err(|e| e.to_string())?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
+            Err(error) => return Err(error.to_string()),
+        };
         let path = entry.path();
-        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
+            Err(error) => return Err(error.to_string()),
+        };
         if file_type.is_symlink() {
             continue;
         }
@@ -757,6 +1176,7 @@ mod tests {
             "Add a health endpoint",
             "Files: src/main.rs",
             Path::new("."),
+            "sk-or-test",
         )
         .unwrap();
         let request = server.join().unwrap();
@@ -767,6 +1187,7 @@ mod tests {
         assert_eq!(payload["task"], "Add a health endpoint");
         assert_eq!(payload["workspace_summary"], "Files: src/main.rs");
         assert!(payload["workspace_root"].is_string());
+        assert_eq!(payload["api_key"], "sk-or-test");
         assert_eq!(plan, "1. Inspect the route.\n2. Add the endpoint.");
         assert_eq!(model, "test-model");
         assert_eq!(run_id, "run-123");

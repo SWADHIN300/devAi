@@ -7,7 +7,7 @@ import time
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator
 
 from .browser_tools import BrowserToolError, browse_url
 from .edit_tools import apply_preview, create_preview
@@ -45,6 +45,7 @@ class PlanRequest(BaseModel):
     task: str = Field(min_length=1, max_length=8_000)
     workspace_summary: str = Field(default="", max_length=65_000)
     workspace_root: str = Field(default=".", max_length=4_000)
+    api_key: SecretStr | None = Field(default=None, max_length=512, repr=False)
 
     @field_validator("task")
     @classmethod
@@ -72,9 +73,15 @@ async def create_plan(payload: PlanRequest) -> PlanResponse:
     store = StateStore()
     task_id = store.create_run(payload.task, payload.workspace_root)
     try:
-        plan, model = await generate_plan(
-            payload.task, payload.workspace_summary, payload.workspace_root, task_id
-        )
+        if payload.api_key:
+            plan, model = await generate_plan(
+                payload.task, payload.workspace_summary, payload.workspace_root, task_id,
+                api_key=payload.api_key.get_secret_value(),
+            )
+        else:
+            plan, model = await generate_plan(
+                payload.task, payload.workspace_summary, payload.workspace_root, task_id
+            )
     except ValueError as exc:
         store.fail_run(task_id, str(exc))
         raise HTTPException(status_code=500, detail=str(exc)) from exc

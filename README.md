@@ -4,19 +4,21 @@ A local-first Rust CLI and Python agent service for exploring software projects.
 
 ## Commands
 
-Run `cargo run` without arguments to open the full-screen black-and-white terminal interface. Type a task and press Enter to request a plan. Use `/analyze`, `/files`, `/help`, `/clear`, and `/quit`; Esc or Ctrl+C exits. The planning service must be running for task requests.
+Run `cargo run` without arguments to open the full-screen black-and-white terminal interface. On first launch, sign in with an OpenRouter account in your browser or enter an OpenRouter API key. Credentials are saved in the operating system credential store. Type a task and press Enter to request a plan. Use `/analyze`, `/files`, `/help`, `/clear`, and `/quit`; Esc or Ctrl+C exits. The planning service must be running for task requests.
 
 ```powershell
 cargo run -- analyze .
 cargo run -- list .
 cargo run -- read README.md
 cargo run -- search "TODO" .
+cargo run -- login
 cargo run -- task "Add a health endpoint" --workspace .
+cargo run -- logout
 ```
 
 Paths passed to `read` and `search` are resolved beneath the selected workspace. The scanner skips common generated and dependency directories.
 
-`task` sends the request and a bounded workspace summary to the local FastAPI service, which sends that summary to OpenRouter. The summary contains a file listing and up to six relevant text files (48 KB total); `.env` files and files whose names suggest secrets or credentials are excluded. Set `DEVPILOT_AGENT_URL` (default `http://127.0.0.1:8000`), `OPENROUTER_API_KEY`, and optionally `DEVPILOT_MODEL` (default `particle-ai/particle-1:free`) to configure the service. The model uses OpenRouter's chat-completions API; no local model download is needed. OpenRouter's free models are rate limited and provider availability can vary.
+`task` sends the saved provider API key and a bounded workspace summary to the local FastAPI service. The key is sent to the configured service URL, so keep `DEVPILOT_AGENT_URL` set to the local service or another HTTPS endpoint you trust. The summary contains a file listing and up to six relevant text files (48 KB total); `.env` files and files whose names suggest secrets or credentials are excluded. Set `DEVPILOT_PROVIDER` in both the CLI and planning service shells: `openrouter` (default), `openai`, `codex` (OpenAI API using a Codex model), `anthropic` (Claude), or `nvidia` (NVIDIA NIM). Set `DEVPILOT_MODEL` to the model ID and the matching key variable (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `NVIDIA_API_KEY`) when you want service-side credentials. The CLI stores a separate key per provider; `devpilot logout` removes the key for the currently selected provider. OpenAI and NVIDIA use chat completions; Claude uses Anthropic's Messages API and receives the workspace summary. No local model download is needed. Model access and pricing depend on your provider account.
 
 The API exposes `POST /v1/tools/read` and `POST /v1/tools/search` for bounded, validated workspace access. Secret-like files and symlinks are rejected. Task plans are saved in SQLite with `pending_approval`, `approved`, `rejected`, or `failed` status; use `GET /v1/tasks`, `GET /v1/tasks/{id}`, and `POST /v1/tasks/{id}/approve` or `/reject` to inspect and approve them. The database defaults to `%LOCALAPPDATA%\DevPilot\devpilot.sqlite3` on Windows and `$XDG_STATE_HOME/devpilot/devpilot.sqlite3` (or `~/.local/state/...`) elsewhere; set `DEVPILOT_DB_PATH` to override it.
 
@@ -27,14 +29,14 @@ The dashboard is served by the same API at `http://127.0.0.1:8000/`. It shows sa
 
 ## Run the planning service on Windows
 
-Install Python 3.12 or newer and Docker Desktop, and create an OpenRouter API key. Then from PowerShell:
+Install Python 3.12 or newer and Docker Desktop. You can create an OpenRouter API key or sign in through the CLI's browser account flow. Then from PowerShell:
 
 ```powershell
 cd C:\Users\swadh\Ai\agent
 $Python = "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe"
 & $Python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-$env:OPENROUTER_API_KEY = "<your-key>"
+$env:DEVPILOT_PROVIDER = "openrouter"
 $env:DEVPILOT_MODEL = "particle-ai/particle-1:free"
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```

@@ -1,7 +1,8 @@
-"""OpenRouter adapter for DevPilot's remote free-tier model."""
+"""Provider adapter for OpenAI-compatible coding model APIs."""
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -16,25 +17,39 @@ from .workspace_tools import read_file, search_code
 
 @dataclass(frozen=True)
 class OpenRouterSettings:
+    provider: str
     base_url: str
     model: str
     api_key: str
 
     @classmethod
-    def from_env(cls) -> "OpenRouterSettings":
-        base_url = os.getenv("DEVPILOT_OPENROUTER_URL", "https://openrouter.ai/api/v1").rstrip("/")
-        model = os.getenv("DEVPILOT_MODEL", "particle-ai/particle-1:free").strip()
-        api_key = os.getenv("OPENROUTER_API_KEY", os.getenv("DEVPILOT_OPENROUTER_API_KEY", "")).strip()
+    def from_env(cls, api_key_override: str | None = None) -> "OpenRouterSettings":
+        provider = os.getenv("DEVPILOT_PROVIDER", "openrouter").strip().lower()
+        defaults = {
+            "openrouter": ("https://openrouter.ai/api/v1", "particle-ai/particle-1:free", "OPENROUTER_API_KEY"),
+            "openai": ("https://api.openai.com/v1", "gpt-5.3-codex", "OPENAI_API_KEY"),
+            "codex": ("https://api.openai.com/v1", "gpt-5.3-codex", "OPENAI_API_KEY"),
+            "nvidia": ("https://integrate.api.nvidia.com/v1", "nvidia/llama-3.3-nemotron-super-49b-v1.5", "NVIDIA_API_KEY"),
+            "anthropic": ("https://api.anthropic.com/v1", "claude-sonnet-4-20250514", "ANTHROPIC_API_KEY"),
+        }
+        if provider not in defaults:
+            raise ValueError("DEVPILOT_PROVIDER must be openrouter, openai, codex, anthropic, or nvidia")
+        base_default, model_default, key_name = defaults[provider]
+        override_url = os.getenv(f"DEVPILOT_{provider.upper()}_URL")
+        base_url = (override_url or base_default).rstrip("/")
+        model = os.getenv("DEVPILOT_MODEL", model_default).strip()
+        legacy_key = os.getenv("DEVPILOT_OPENROUTER_API_KEY", "") if provider == "openrouter" else ""
+        api_key = (api_key_override or os.getenv(key_name, legacy_key)).strip()
         if not base_url.startswith("https://"):
-            raise ValueError("DEVPILOT_OPENROUTER_URL must use HTTPS")
+            raise ValueError(f"DEVPILOT_{provider.upper()}_URL must use HTTPS")
         if not model:
             raise ValueError("DEVPILOT_MODEL cannot be empty")
         if not api_key:
             raise OpenRouterError(
-                "OPENROUTER_API_KEY is not set. Create a key at openrouter.ai and set it in your shell.",
+                f"{key_name} is not set. Configure an API key for the selected {provider} provider.",
                 status_code=503,
             )
-        return cls(base_url=base_url, model=model, api_key=api_key)
+        return cls(provider=provider, base_url=base_url, model=model, api_key=api_key)
 
 
 class OpenRouterError(Exception):
@@ -138,9 +153,10 @@ async def _call_tool(name: str, raw_arguments: str, workspace_root: str, task_id
 
 
 async def generate_plan(
-    task: str, workspace_summary: str, workspace_root: str = ".", task_id: str | None = None
+    task: str, workspace_summary: str, workspace_root: str = ".", task_id: str | None = None,
+    api_key: str | None = None,
 ) -> tuple[str, str]:
-    settings = OpenRouterSettings.from_env()
+    settings = OpenRouterSettings.from_env(api_key)
     timeout = httpx.Timeout(120.0, connect=10.0)
     messages = [
         {"role": "system", "content": (
@@ -156,52 +172,104 @@ async def generate_plan(
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             for _ in range(5):
-                response = await client.post(
-                    f"{settings.base_url}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {settings.api_key}",
-                        "Content-Type": "application/json",
-                        "X-Title": "DevPilot",
-                    },
-                    json={
+                anthropic = settings.provider == "anthropic"
+                request_body = ({
+                    "model": settings.model,
+                    "system": messages[0]["content"],
+                    "messages": messages[1:],
+                    "tools": [
+                        {
+                            "name": tool["function"]["name"],
+                            "description": tool["function"]["description"],
+                            "input_schema": tool["function"]["parameters"],
+                        }
+                        for tool in TOOLS
+                    ],
+                    "max_tokens": 1024,
+                } if anthropic else {
                         "model": settings.model,
                         "messages": messages,
                         "tools": TOOLS,
                         "tool_choice": "auto",
                         "stream": False,
                         "max_tokens": 1024,
-                    },
+                    })
+                headers = ({
+                    "x-api-key": settings.api_key,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json",
+                } if anthropic else {
+                    "Authorization": f"Bearer {settings.api_key}",
+                    "Content-Type": "application/json",
+                    "X-Title": "DevPilot",
+                })
+                response = await client.post(
+                    f"{settings.base_url}/messages" if anthropic else f"{settings.base_url}/chat/completions",
+                    headers=headers,
+                    json=request_body,
                 )
                 response.raise_for_status()
                 body = response.json()
                 choices = body.get("choices") if isinstance(body, dict) else None
                 message = choices[0].get("message") if isinstance(choices, list) and choices else None
+                if anthropic and isinstance(body, dict):
+                    content = body.get("content", [])
+                    text_parts = [part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text"]
+                    tool_calls = [
+                        {
+                            "id": part.get("id", ""),
+                            "type": "function",
+                            "function": {
+                                "name": part.get("name", ""),
+                                "arguments": json.dumps(part.get("input", {})),
+                            },
+                        }
+                        for part in content if isinstance(part, dict) and part.get("type") == "tool_use"
+                    ]
+                    message = {"content": "\n".join(text_parts), "tool_calls": tool_calls}
                 tool_calls = message.get("tool_calls", []) if isinstance(message, dict) else []
                 if not tool_calls:
                     break
                 tool_calls = tool_calls[:4]
-                messages.append({"role": "assistant", "content": message.get("content"), "tool_calls": tool_calls})
+                if anthropic:
+                    messages.append({"role": "assistant", "content": body.get("content", [])})
+                    tool_results = []
+                else:
+                    messages.append({"role": "assistant", "content": message.get("content"), "tool_calls": tool_calls})
                 for tool_call in tool_calls[:4]:
                     function = tool_call.get("function", {})
                     result = await _call_tool(
                         function.get("name", ""), function.get("arguments", "{}"), workspace_root, task_id
                     )
-                    messages.append({"role": "tool", "tool_call_id": tool_call.get("id", ""), "content": result})
+                    if anthropic:
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tool_call.get("id", ""),
+                            "content": result,
+                        })
+                    else:
+                        messages.append({"role": "tool", "tool_call_id": tool_call.get("id", ""), "content": result})
+                if anthropic:
+                    messages.append({"role": "user", "content": tool_results})
     except OpenRouterError:
         raise
     except httpx.ConnectError as exc:
-        raise OpenRouterError("OpenRouter is unavailable. Check your internet connection and retry.", 503) from exc
+        raise OpenRouterError(f"{settings.provider} is unavailable. Check your internet connection and retry.", 503) from exc
     except httpx.TimeoutException as exc:
-        raise OpenRouterError("OpenRouter did not respond before the 120 second timeout.", 504) from exc
+        raise OpenRouterError(f"{settings.provider} did not respond before the 120 second timeout.", 504) from exc
     except httpx.HTTPStatusError as exc:
-        message = "OpenRouter request failed. Check the API key, model ID, and free-tier limits."
+        message = f"{settings.provider} request failed. Check the API key, model ID, and account limits."
         raise OpenRouterError(message, exc.response.status_code if 400 <= exc.response.status_code < 500 else 502) from exc
     except (httpx.HTTPError, ValueError) as exc:
-        raise OpenRouterError("OpenRouter returned an invalid response.", 502) from exc
+        raise OpenRouterError(f"{settings.provider} returned an invalid response.", 502) from exc
 
     choices = body.get("choices") if isinstance(body, dict) else None
     message = choices[0].get("message") if isinstance(choices, list) and choices else None
+    if settings.provider == "anthropic" and isinstance(body, dict):
+        content = body.get("content", [])
+        text_parts = [part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text"]
+        message = {"content": "\n".join(text_parts)}
     plan = message.get("content") if isinstance(message, dict) else None
     if not isinstance(plan, str) or not plan.strip():
-        raise OpenRouterError("OpenRouter returned an empty plan.", 502)
+        raise OpenRouterError(f"{settings.provider} returned an empty plan.", 502)
     return plan.strip(), settings.model
