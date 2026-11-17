@@ -8,3 +8,4 @@ __pycache__/
 /.cargo/config.toml
 /agent-ts/node_modules/
 /agent-ts/dist/
+/devin-cli-research/
