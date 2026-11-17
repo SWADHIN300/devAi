@@ -4,7 +4,9 @@ import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
-const dbPath = process.env.DEVPILOT_DB_PATH || process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, "DevPilot", "devpilot.sqlite3") : join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "devpilot", "devpilot.sqlite3");
+const dbPath = process.env.DEVPILOT_DB_PATH || (process.env.LOCALAPPDATA
+  ? join(process.env.LOCALAPPDATA, "DevPilot", "devpilot.sqlite3")
+  : join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "devpilot", "devpilot.sqlite3"));
 mkdirSync(dirname(dbPath), { recursive: true });
 export const db = new DatabaseSync(dbPath);
 db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;

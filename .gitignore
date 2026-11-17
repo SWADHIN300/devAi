@@ -5,5 +5,6 @@ __pycache__/
 .pytest_cache/
 .pytest_tmp/
 /agent/.pytest_tmp/
-/devin-cli-research/
 /.cargo/config.toml
+/agent-ts/node_modules/
+/agent-ts/dist/
